@@ -1,0 +1,495 @@
+diff --git a/comfy/controlnet.py b/comfy/controlnet.py
+index a157a9df..7bba63c4 100644
+--- a/comfy/controlnet.py
++++ b/comfy/controlnet.py
+@@ -39,6 +39,7 @@ import comfy.cldm.mmdit
+ import comfy.ldm.hydit.controlnet
+ import comfy.ldm.flux.controlnet
+ import comfy.ldm.qwen_image.controlnet
++import comfy.ldm.minimax.controlnet
+ import comfy.cldm.dit_embedder
+ from typing import TYPE_CHECKING, Union
+ if TYPE_CHECKING:
+@@ -723,6 +724,166 @@ def load_controlnet_qwen_fun(sd, model_options={}):
+     )
+     return control
+ 
++class MiniMaxH3ControlNet(ControlNet):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.inpaint_mask = None    # [T, H, W] pixel mask, 1 = regenerate
++        self.inpaint_video = None   # [T, C, H, W] source frames behind the mask
++
++    def set_inpaint(self, mask, video):
++        self.inpaint_mask = mask
++        self.inpaint_video = video
++        return self
++
++    def _fit_frames(self, frames, pixel_t, width, height):
++        # short videos hold their last frame
++        idx = torch.arange(pixel_t).clamp(max=frames.shape[0] - 1)
++        return comfy.utils.common_upscale(frames[idx], width, height, self.upscale_algorithm, "center")
++
++    def _fit_latent_t(self, latent, latent_t):
++        if latent.shape[2] > latent_t:
++            return latent[:, :, :latent_t]
++        if latent.shape[2] < latent_t:
++            return torch.nn.functional.pad(latent, (0, 0, 0, 0, 0, latent_t - latent.shape[2]))
++        return latent
++
++    def _encode(self, frames):
++        # the H3 VAE normalizes internally and returns the posterior mean
++        return self.vae.encode(frames.movedim(1, -1)).to(torch.float32)
++
++    def get_control(self, x_noisy, t, cond, batched_number, transformer_options):
++        control_prev = None
++        if self.previous_controlnet is not None:
++            control_prev = self.previous_controlnet.get_control(x_noisy, t, cond, batched_number, transformer_options)
++
++        if self.timestep_range is not None:
++            if t[0] > self.timestep_range[0] or t[0] < self.timestep_range[1]:
++                return control_prev
++
++        # target video latent geometry
++        latent_shapes = cond.get("latent_shapes", None)
++        vs = tuple(latent_shapes[0]) if latent_shapes is not None else tuple(x_noisy.shape)
++        latent_t, lat_h, lat_w = vs[2], vs[3], vs[4]
++
++        if self.cond_hint is None or self.cond_hint.shape[2:] != (latent_t, lat_h, lat_w):
++            if self.vae is None:
++                raise ValueError("This Controlnet needs a VAE but none was provided, please use a ControlNetApply node with a VAE input and connect it.")
++            del self.cond_hint
++            self.cond_hint = None
++            # frames 17k+5 <-> latents 5k+2
++            pixel_t = max((latent_t - 2) // 5, 0) * 17 + 5
++            scale = self.vae.spacial_compression_encode()
++            width, height = lat_w * scale, lat_h * scale
++            channels = self.latent_format.latent_channels
++            loaded_models = comfy.model_management.loaded_models(only_currently_used=True)
++
++            if self.cond_hint_original is not None:
++                hint = self._fit_latent_t(self._encode(self._fit_frames(self.cond_hint_original, pixel_t, width, height)), latent_t)
++            else:
++                hint = torch.zeros(1, channels, latent_t, lat_h, lat_w)
++
++            if self.inpaint_mask is not None:
++                # binarize, resize, re-harden the resampled edges; visibility is 1 - mask
++                mask = (self.inpaint_mask.reshape(-1, 1, self.inpaint_mask.shape[-2], self.inpaint_mask.shape[-1]) > 0.5).to(torch.float32)
++                idx = torch.arange(pixel_t).clamp(max=mask.shape[0] - 1)
++                mask = comfy.utils.common_upscale(mask[idx], width, height, "bilinear", "center")
++                visibility = 1.0 - (mask > 0.5).to(torch.float32)  # [T, 1, H, W]
++                if self.inpaint_video is not None:
++                    source = self._fit_frames(self.inpaint_video, pixel_t, width, height)
++                else:
++                    source = torch.zeros(pixel_t, 3, height, width)
++                masked_latent = self._fit_latent_t(self._encode(source * visibility.to(source.device)), latent_t)
++                visibility_latent = torch.nn.functional.interpolate(
++                    visibility.squeeze(1)[None, None], size=(latent_t, lat_h, lat_w), mode="trilinear", align_corners=False)
++                hint = torch.cat([hint, visibility_latent.to(hint.device), masked_latent.to(hint.device)], dim=1)
++
++            comfy.model_management.load_models_gpu(loaded_models)
++            self.cond_hint = hint
++        self.cond_hint = self.cond_hint.to(device=x_noisy.device)
++
++        out = {"minimax_fun": [{"model": self.control_model, "latent": self.cond_hint, "strength": self.strength}]}
++        if control_prev is not None:
++            for key, value in control_prev.items():
++                if key == "minimax_fun":
++                    out[key] = value + out[key]
++                else:
++                    out[key] = value
++        return out
++
++    def copy(self):
++        c = MiniMaxH3ControlNet(None, global_average_pooling=self.global_average_pooling, load_device=self.load_device, manual_cast_dtype=self.manual_cast_dtype)
++        c.control_model = self.control_model
++        c.control_model_wrapped = self.control_model_wrapped
++        self.copy_to(c)
++        c.inpaint_mask = self.inpaint_mask
++        c.inpaint_video = self.inpaint_video
++        return c
++
++
++def convert_minimax_h3_fun(sd):
++    # VideoX-Fun diffusers naming -> core naming: fused qkv, fc1 halves swapped
++    out = {}
++    for k, v in sd.items():
++        if k.endswith(".attn.to_q.weight"):
++            base = k[:-len("to_q.weight")]
++            out[base + "qkv_proj.weight"] = torch.cat([sd[base + "to_q.weight"], sd[base + "to_k.weight"], sd[base + "to_v.weight"]], dim=0)
++        elif k.endswith(".attn.to_k.weight") or k.endswith(".attn.to_v.weight"):
++            pass
++        elif k.endswith(".ff.net.0.proj.weight"):
++            half = v.shape[0] // 2
++            out[k.replace(".ff.net.0.proj.", ".mlp.fc1.")] = torch.cat([v[half:], v[:half]], dim=0)
++        else:
++            out[k.replace(".attn.norm_q.", ".attn.q_norm.").replace(".attn.norm_k.", ".attn.k_norm.")
++                .replace(".attn.to_out.0.", ".attn.out_proj.").replace(".ff.net.2.", ".mlp.fc2.")] = v
++    return out
++
++
++def load_controlnet_minimax_h3(sd, model_options={}):
++    if "control_blocks.0.attn.to_q.weight" in sd:
++        sd = convert_minimax_h3_fun(sd)
++
++    load_device = comfy.model_management.get_torch_device()
++    quant = comfy.utils.detect_layer_quantization(sd, "")
++    if quant is not None:
++        # weight_dtype would report the int8 storage dtype, not the compute dtype
++        unet_dtype = model_options.get("dtype", torch.bfloat16)
++    else:
++        unet_dtype = model_options.get("dtype", comfy.utils.weight_dtype(sd))
++    manual_cast_dtype = comfy.model_management.unet_manual_cast(unet_dtype, load_device)
++    operations = model_options.get("custom_operations", None)
++    if operations is None:
++        if quant is not None:
++            operations = comfy.ops.mixed_precision_ops(quant, unet_dtype)
++        else:
++            operations = comfy.ops.pick_operations(unet_dtype, manual_cast_dtype)
++
++    proj_in = sd["control_proj_in.weight"]
++    num_blocks = 0
++    while "control_blocks.{}.after_proj.weight".format(num_blocks) in sd:
++        num_blocks += 1
++    qkv = sd["control_blocks.0.attn.qkv_proj.weight"]
++    head_dim = sd["control_blocks.0.attn.q_norm.weight"].shape[0]
++    t_dim = sd["control_blocks.0.adaln_proj.linear.weight"].shape[1]
++    hidden = proj_in.shape[0]
++
++    model = comfy.ldm.minimax.controlnet.MiniMaxH3FunControl(
++        control_in_dim=proj_in.shape[1] // 4,
++        injection_layers=tuple(range(0, num_blocks * 10, 10)),
++        hidden_size=hidden,
++        num_attention_heads=qkv.shape[0] // (3 * head_dim),
++        attention_head_dim=head_dim,
++        ffn_hidden_size=sd["control_blocks.0.mlp.fc1.weight"].shape[0] // 2,
++        time_embed_dim=t_dim,
++        use_adaln_curves=t_dim <= 16,
++        operations=operations,
++        device=comfy.model_management.unet_offload_device(),
++        dtype=unet_dtype,
++    )
++    model = controlnet_load_state_dict(model, sd)
++    return MiniMaxH3ControlNet(model, compression_ratio=1, latent_format=comfy.latent_formats.MiniMaxH3Video(),
++                               load_device=load_device, manual_cast_dtype=manual_cast_dtype, extra_conds=[])
++
++
+ def convert_mistoline(sd):
+     return comfy.utils.state_dict_prefix_replace(sd, {"single_controlnet_blocks.": "controlnet_single_blocks."})
+ 
+@@ -735,6 +896,10 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
+     if "lora_controlnet" in controlnet_data:
+         return ControlLora(controlnet_data, model_options=model_options)
+ 
++    if ("control_proj_in.weight" in controlnet_data and "control_blocks.0.adaln_proj.linear.weight" in controlnet_data
++            and ("control_blocks.0.attn.to_q.weight" in controlnet_data or "control_blocks.0.attn.qkv_proj.weight" in controlnet_data)): # MiniMax H3 Fun
++        return load_controlnet_minimax_h3(controlnet_data, model_options=model_options)
++
+     controlnet_config = None
+     supported_inference_dtypes = None
+ 
+diff --git a/comfy/ldm/minimax/model.py b/comfy/ldm/minimax/model.py
+index f2ab2811..359dc6b9 100644
+--- a/comfy/ldm/minimax/model.py
++++ b/comfy/ldm/minimax/model.py
+@@ -646,10 +646,11 @@ class MiniMaxH3Model(nn.Module):
+             return torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
+         return self.time_embedder(t_vals).to(dtype)
+ 
+-    def _run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
++    def _run_blocks(self, h, t_emb, mod_segments, layout, transformer_options, control_streams=()):
+         device = h.device
+         # rotation table computed once per forward, consumed by the kitchen split-half rope
+         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), h.dtype)
++        audio_pos = layout.audio_pos.to(device) if control_streams else None   # Fun controlnet: no skip into audio rows
+ 
+         patches_replace = transformer_options.get("patches_replace", {})
+         blocks_replace = patches_replace.get("dit", {})
+@@ -667,6 +668,13 @@ class MiniMaxH3Model(nn.Module):
+                     {"original_block": block_wrap})["img"]
+             else:
+                 h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
++            for s in control_streams:
++                j = s["next"]
++                if j < len(s["model"].injection_layers) and s["model"].injection_layers[j] == i:
++                    s["c"], skip = s["model"].step(j, s["c"], t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
++                    skip[audio_pos] = 0
++                    h.add_(skip, alpha=s["strength"])
++                    s["next"] = j + 1
+         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, malloc_scope="block")
+         return h
+ 
+@@ -713,7 +721,7 @@ class MiniMaxH3Model(nn.Module):
+                       + (1.0 + (scale - 1.0) * sigma_a).to(out[1].dtype) * out[1])
+         return out
+ 
+-    def _forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, denoise_mask=None, audio_denoise_mask=None, **kwargs):
++    def _forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, denoise_mask=None, audio_denoise_mask=None, control=None, **kwargs):
+         video_x, audio_x = x[0], x[1]
+         orig_t, orig_h, orig_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
+         video_x = comfy.ldm.common_dit.pad_to_patch_size(video_x, self.patch_size)
+@@ -800,7 +808,15 @@ class MiniMaxH3Model(nn.Module):
+ 
+         h = self._embed_and_pack(video_x, audio_x, context, layout, payload, transformer_options)
+         t_emb = self._time_embedding(unique_t, device, dtype)
+-        h = self._run_blocks(h, t_emb, mod_segments, layout, transformer_options)
++
++        # Fun controlnet streams, advanced one block per addressed layer in _run_blocks
++        control_streams = []
++        if control is not None:
++            for entry in control.get("minimax_fun", ()):
++                cm = entry["model"]
++                control_streams.append({"model": cm, "c": cm.init_stream(h, entry["latent"].to(device), layout, t_emb),
++                                        "strength": entry["strength"], "next": 0})
++        h = self._run_blocks(h, t_emb, mod_segments, layout, transformer_options, control_streams=control_streams)
+ 
+         # target streams are single contiguous segments (audio then video, last two)
+         va, vb, _ = next(s for s in layout.segments if s[2] == "video")
+diff --git a/comfy/ldm/wan/model_animate2.py b/comfy/ldm/wan/model_animate2.py
+index 744401ec..ccc3207a 100644
+--- a/comfy/ldm/wan/model_animate2.py
++++ b/comfy/ldm/wan/model_animate2.py
+@@ -43,15 +43,19 @@ class WanAnimate2SelfAttention(WanSelfAttention):
+         out = optimized_attention(AttentionTensorContainer(q.reshape(b, s, n * d)), AttentionTensorContainer(k.reshape(b, s, n * d)), AttentionTensorContainer(v.reshape(b, s, n * d)), heads=self.num_heads, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
+         return self.o(self._attn1_patch(out, q, k, transformer_options)), k, v
+ 
+-    def forward_gen(self, x, freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, transformer_options={}):
++    def forward_gen(self, x, freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, log_scale=0.0, transformer_options={}):
+         # frame j attends every gen token plus pose frame j-1 (frame 0 is the reference slot and has none)
+         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+         q, k, v = self.qkv(x, freqs)
+         if ref_strength != 1.0:
+             v[:, :hw] *= ref_strength  # frame 0 is the reference image's slot
++        attn_mask = None
++        if log_scale != 0.0:
++            attn_mask = q.new_zeros((1, s + (hw if k_pose is not None else 0)))
++            attn_mask[:, hw:2 * hw] = log_scale
+ 
+         if k_pose is None:  # pose influence windowed out: plain self-attention, no per-frame loop
+-            out = optimized_attention(AttentionTensorContainer(q.reshape(b, s, n * d)), AttentionTensorContainer(k.reshape(b, s, n * d)), AttentionTensorContainer(v.reshape(b, s, n * d)), heads=self.num_heads, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
++            out = optimized_attention(AttentionTensorContainer(q.reshape(b, s, n * d)), AttentionTensorContainer(k.reshape(b, s, n * d)), AttentionTensorContainer(v.reshape(b, s, n * d)), heads=self.num_heads, mask=attn_mask, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
+             return self.o(self._attn1_patch(out, q, k, transformer_options))
+ 
+         # gen half is the same every frame; only the hw-token pose tail is rewritten
+@@ -63,11 +67,13 @@ class WanAnimate2SelfAttention(WanSelfAttention):
+             q_j = q[:, j * hw:(j + 1) * hw].reshape(b, hw, n * d)
+             if j == 0:
+                 kk, vv = k, v
++                mask = attn_mask[:, :s] if attn_mask is not None else None
+             else:
+                 kbuf[:, s:] = k_pose[:, (j - 1) * hw:j * hw]
+                 vbuf[:, s:] = v_pose[:, (j - 1) * hw:j * hw]
+                 kk, vv = kbuf, vbuf
+-            out[:, j * hw:(j + 1) * hw] = optimized_attention(AttentionTensorContainer(q_j), AttentionTensorContainer(kk.reshape(b, kk.shape[1], n * d)), AttentionTensorContainer(vv.reshape(b, kk.shape[1], n * d)), heads=self.num_heads, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
++                mask = attn_mask
++            out[:, j * hw:(j + 1) * hw] = optimized_attention(AttentionTensorContainer(q_j), AttentionTensorContainer(kk.reshape(b, kk.shape[1], n * d)), AttentionTensorContainer(vv.reshape(b, kk.shape[1], n * d)), heads=self.num_heads, mask=mask, preferred_attention=self.comfy_attention, transformer_options=transformer_options)
+         return self.o(self._attn1_patch(out, q, k, transformer_options))
+ 
+ 
+@@ -102,10 +108,10 @@ class WanAnimate2Block(WanAttentionBlock):
+         x_pose = x_pose.contiguous()
+         return self.self_attn.kv(modulate(x_pose, self.norm1, e[0], e[1]), freqs)
+ 
+-    def forward_gen(self, x, e, freqs, context, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, context_img_len=257, transformer_options={}):
++    def forward_gen(self, x, e, freqs, context, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, log_scale=0.0, context_img_len=257, transformer_options={}):
+         e = self._modulation(e, x)
+         x = x.contiguous()
+-        y = self.self_attn.forward_gen(modulate(x, self.norm1, e[0], e[1]), freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=ref_strength, transformer_options=transformer_options)
++        y = self.self_attn.forward_gen(modulate(x, self.norm1, e[0], e[1]), freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=ref_strength, log_scale=log_scale, transformer_options=transformer_options)
+         x = torch.addcmul(x, y, repeat_e(e[2], x))
+         del y
+         return self._cross_attn_ffn(x, e, context, context_img_len, transformer_options)
+@@ -284,7 +290,7 @@ class WanAnimate2Model(WanModel):
+         return self.forward_orig(x, timestep, context, clip_fea=clip_fea, freqs=freqs, freqs_pose=freqs_pose, pose_latents=pose_latents,
+                                  clip_fea_pose=clip_fea_pose, context_pose=context_pose, transformer_options=transformer_options, **kwargs)[:, :, :t, :h, :w]
+ 
+-    def forward_orig(self, x, t, context, clip_fea=None, freqs=None, freqs_pose=None, pose_latents=None, clip_fea_pose=None, context_pose=None, pose_strength=1.0, reference_strength=1.0, transformer_options={}, **kwargs):
++    def forward_orig(self, x, t, context, clip_fea=None, freqs=None, freqs_pose=None, pose_latents=None, clip_fea_pose=None, context_pose=None, pose_strength=1.0, reference_strength=1.0, log_scale=0.0, transformer_options={}, **kwargs):
+         x_input = x[:, :, 1:]  # video-only: frame 0 is the reference slot, offset past it below
+         x = self.patch_embedding(x.float()).to(x.dtype)
+         grid_sizes = x.shape[2:]
+@@ -379,11 +385,11 @@ class WanAnimate2Model(WanModel):
+ 
+             if ("double_block", i) in blocks_replace:
+                 def block_wrap(args, block=block, k_pose=k_pose, v_pose=v_pose):
+-                    return {"img": block.forward_gen(args["img"], args["vec"], args["pe"], args["txt"], k_pose, v_pose, f_gen, hw, buffers, ref_strength=reference_strength, context_img_len=context_img_len, transformer_options=args["transformer_options"])}
++                    return {"img": block.forward_gen(args["img"], args["vec"], args["pe"], args["txt"], k_pose, v_pose, f_gen, hw, buffers, ref_strength=reference_strength, log_scale=log_scale, context_img_len=context_img_len, transformer_options=args["transformer_options"])}
+                 out = blocks_replace[("double_block", i)]({"img": x, "txt": context_gen, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+                 x = out["img"]
+             else:
+-                x = block.forward_gen(x, e0, freqs, context_gen, k_pose, v_pose, f_gen, hw, buffers, ref_strength=reference_strength, context_img_len=context_img_len, transformer_options=transformer_options)
++                x = block.forward_gen(x, e0, freqs, context_gen, k_pose, v_pose, f_gen, hw, buffers, ref_strength=reference_strength, log_scale=log_scale, context_img_len=context_img_len, transformer_options=transformer_options)
+ 
+             if "double_block" in patches:
+                 for p in patches["double_block"]:
+diff --git a/comfy_extras/nodes_minimax_h3.py b/comfy_extras/nodes_minimax_h3.py
+index 8153d6c5..9fb98cf0 100644
+--- a/comfy_extras/nodes_minimax_h3.py
++++ b/comfy_extras/nodes_minimax_h3.py
+@@ -17,6 +17,7 @@ import torch.nn.functional as F
+ import comfy.audio
+ 
+ import nodes
++import comfy.controlnet
+ import comfy.model_management
+ import comfy.model_prefetch
+ import comfy.model_sampling
+@@ -32,6 +33,11 @@ CANVAS_MULTIPLE = 32
+ BASE_SHORT_EDGE = 768
+ MAX_PIXELS = 768 * 1344
+ REF_IMAGE_SHORT_EDGE = 2048
++# Long-edge cap for "max" refs. The short-edge rule alone never engages on
++# tall portrait refs (e.g. 1360x4096), which sent ~5.6 MP per reference into
++# the Qwen vision tower and OOM'd conditioning on 32 GB cards with 8 refs.
++# 3584 is the measured ceiling for 768x1344/243f with 8 refs (3840 OOMs).
++REF_IMAGE_LONG_EDGE = 3584
+ FPS = 24
+ AUDIO_LATENT_FPS = 40
+ 
+@@ -281,11 +287,11 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
+                 io.Int.Input("height", default=768, min=32, max=nodes.MAX_RESOLUTION, step=32),
+                 io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, (124 = ~5s, trained range is ~124-362)"),
+                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
+-                    tooltip="Reference image sizing. 'match' scales each ref (down only, keeping aspect) to the generation's pixel area; 'max' uses the reference pipeline's 2048px short edge for best identity fidelity. Reference tokens ride through every sampling step, so 'max' can be several times slower."),
++                    tooltip="Reference image sizing. 'match' scales each ref (down only, keeping aspect) to the generation's pixel area; 'max' keeps references up to 2048px short edge / 3584px long edge for best identity fidelity. Reference tokens ride through every sampling step, so 'max' can be several times slower."),
+                 io.Autogrow.Input("ref_images", optional=True,
+                     template=io.Autogrow.TemplatePrefix(
+                         input=io.Image.Input("ref_image", tooltip="Reference image (downscaled to 2048 short edge if larger, never upscaled)"),
+-                        prefix="ref_image_", min=0, max=9)),
++                        prefix="ref_image_", min=0, max=15)),
+                 io.Autogrow.Input("ref_videos", optional=True,
+                     template=io.Autogrow.TemplatePrefix(
+                         input=io.Image.Input("ref_video", tooltip="Reference video frames at 24 fps (2-15s)"),
+@@ -318,7 +324,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
+                 # aspect-preserving scale (down only) to the generation's pixel area
+                 scale = min(1.0, math.sqrt((width * height) / (w * h)))
+             else:
+-                scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h))
++                scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h), REF_IMAGE_LONG_EDGE / max(w, h))
+             tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+             th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+             resized = _resize(img[:1], tw, th, "disabled")
+@@ -424,6 +430,8 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
+         return io.NodeOutput(m)
+ 
+ 
++# Keep upstream ModelPatch helpers available to CRT while retaining the Hub's
++# conditioning-based ControlNet node contract below.
+ class MiniMaxH3FunControlPatch:
+     def __init__(self, model_patch, vae, control_video, mask, source_video, strength, sigma_start, sigma_end):
+         self.model_patch = model_patch
+@@ -593,13 +601,74 @@ class MiniMaxH3FunControlBlockPatch:
+ 
+ 
+ class MiniMaxH3FunControlNetApply(io.ComfyNode):
++    """Apply the Fun ControlNet-Union: control video, inpainting, or both.
++
++    Unconnected inputs keep their control channels zero, the checkpoint's
++    trained fallback for that mode.
++    """
++
+     @classmethod
+     def define_schema(cls):
+         return io.Schema(
+             node_id="MiniMaxH3FunControlNetApply",
+-            description="Apply a MiniMax H3 Fun ControlNet to a text-to-video model as a model patch.",
++            description="Apply a MiniMax H3 Fun ControlNet with an optional control video and/or inpainting mask.",
+             display_name="Apply MiniMax H3 Fun ControlNet",
+             search_aliases=["minimax controlnet", "h3 controlnet", "video inpaint controlnet"],
++            category="model/conditioning/controlnet",
++            inputs=[
++                io.Conditioning.Input("positive"),
++                io.ControlNet.Input("control_net"),
++                io.Vae.Input("vae"),
++                io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
++                io.Float.Input("start_percent", default=0.0, min=0.0, max=1.0, step=0.001, advanced=True),
++                io.Float.Input("end_percent", default=1.0, min=0.0, max=1.0, step=0.001, advanced=True),
++                io.Image.Input("control_video", optional=True),
++                io.Mask.Input("mask", optional=True, tooltip="1 marks the regions to regenerate."),
++                io.Image.Input("source_video", optional=True, tooltip="Video behind the mask; only read when a mask is given."),
++            ],
++            outputs=[io.Conditioning.Output(display_name="positive")],
++        )
++
++    @classmethod
++    def execute(cls, positive, control_net, vae, strength, start_percent, end_percent,
++                control_video=None, mask=None, source_video=None) -> io.NodeOutput:
++        if strength == 0 or (control_video is None and mask is None):
++            return io.NodeOutput(positive)
++        if not isinstance(control_net, comfy.controlnet.MiniMaxH3ControlNet):
++            raise ValueError("this node needs a MiniMax H3 Fun ControlNet")
++
++        control_hint = control_video.movedim(-1, 1) if control_video is not None else None
++        source_hint = source_video.movedim(-1, 1) if source_video is not None else None
++        cnets = {}
++
++        c = []
++        for t in positive:
++            d = t[1].copy()
++            prev_cnet = d.get('control', None)
++            if prev_cnet in cnets:
++                c_net = cnets[prev_cnet]
++            else:
++                c_net = control_net.copy().set_cond_hint(control_hint, strength, (start_percent, end_percent), vae=vae)
++                if mask is not None:
++                    c_net.set_inpaint(mask, source_hint)
++                c_net.set_previous_controlnet(prev_cnet)
++                cnets[prev_cnet] = c_net
++            d['control'] = c_net
++            d['control_apply_to_uncond'] = True
++            c.append([t[0], d])
++        return io.NodeOutput(c)
++
++
++# Keep the existing Hub v1 conditioning node and expose the upstream model-patch
++# contract separately. Union 2.0 requires the latter and metadata-aware loader.
++class MiniMaxH3FunControlNetApplyV2(io.ComfyNode):
++    @classmethod
++    def define_schema(cls):
++        return io.Schema(
++            node_id="MiniMaxH3FunControlNetApplyV2",
++            description="Apply a MiniMax H3 Fun ControlNet to a text-to-video model as a model patch.",
++            display_name="Apply MiniMax H3 Fun ControlNet (native model patch)",
++            search_aliases=["minimax controlnet", "h3 controlnet", "video inpaint controlnet"],
+             category="model/patch/minimax",
+             inputs=[
+                 io.Model.Input("model"),
+@@ -797,6 +866,7 @@ class MiniMaxH3Extension(ComfyExtension):
+             MiniMaxH3ReferenceToVideo,
+             MiniMaxH3SigmaShift,
+             MiniMaxH3FunControlNetApply,
++            MiniMaxH3FunControlNetApplyV2,
+             MiniMaxH3LatentUpscaleWithModel,
+             MiniMaxH3ImageConditioning,
+             PH3ImageConditioning,
+diff --git a/comfy_extras/nodes_wan.py b/comfy_extras/nodes_wan.py
+index 02ec00ad..a62cc0bd 100644
+--- a/comfy_extras/nodes_wan.py
++++ b/comfy_extras/nodes_wan.py
+@@ -1284,6 +1284,7 @@ class WanAnimate2ToVideo(io.ComfyNode):
+                 io.Float.Input("pose_start_percent", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Sampling percent at which the pose influence starts. Outside the window the pose branch is skipped entirely, which also speeds those steps up."),
+                 io.Float.Input("pose_end_percent", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Sampling percent at which the pose influence ends. Motion is mostly established early, so e.g. 0.7 can loosen fine detail while keeping the choreography."),
+                 io.Float.Input("reference_image_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Scales how strongly generated frames attend to the reference image's latent frame. Below 1.0 loosens identity/appearance adherence (e.g. to let the prompt restyle), above tightens it against drift."),
++                io.Float.Input("log_scale", default=0.0, min=-10.0, max=10.0, step=0.01, tooltip="Additive attention bias for the first generated latent frame. Distilled Animate-2 recipes use -1.3.", extra_dict={"hub_capabilities": ["wan_animate2_log_scale"]}),
+             ],
+             outputs=[
+                 io.Conditioning.Output(display_name="positive"),
+@@ -1297,7 +1298,7 @@ class WanAnimate2ToVideo(io.ComfyNode):
+         )
+ 
+     @classmethod
+-    def execute(cls, positive, negative, vae, width, height, length, batch_size, video_frame_offset, reference_image=None, pose_video=None, clip_vision_output=None, positive_pose=None, clip_vision_output_pose=None, continue_motion=None, pose_strength=1.0, pose_start_percent=0.0, pose_end_percent=1.0, reference_image_strength=1.0) -> io.NodeOutput:
++    def execute(cls, positive, negative, vae, width, height, length, batch_size, video_frame_offset, reference_image=None, pose_video=None, clip_vision_output=None, positive_pose=None, clip_vision_output_pose=None, continue_motion=None, pose_strength=1.0, pose_start_percent=0.0, pose_end_percent=1.0, reference_image_strength=1.0, log_scale=0.0) -> io.NodeOutput:
+         if pose_start_percent > pose_end_percent:
+             raise ValueError("pose_start_percent ({}) must not be greater than pose_end_percent ({}).".format(pose_start_percent, pose_end_percent))
+         latent_length = ((length - 1) // 4) + 1
+@@ -1340,6 +1341,9 @@ class WanAnimate2ToVideo(io.ComfyNode):
+         if reference_image_strength != 1.0:
+             positive = node_helpers.conditioning_set_values(positive, {"reference_strength": reference_image_strength})
+             negative = node_helpers.conditioning_set_values(negative, {"reference_strength": reference_image_strength})
++        if log_scale != 0.0:
++            positive = node_helpers.conditioning_set_values(positive, {"log_scale": log_scale})
++            negative = node_helpers.conditioning_set_values(negative, {"log_scale": log_scale})
+ 
+         # set on the negative too: upstream runs the pose branch once, outside the CFG loop, so it never sees the negative prompt
+         pose_values = {}
