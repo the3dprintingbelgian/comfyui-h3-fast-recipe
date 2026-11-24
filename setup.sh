@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Set up the MiniMax H3 fast recipe on a fresh Linux machine (a Colab GPU runtime, a rented box, a new PC):
-#   ComfyUI v0.45.0 + patches/comfyui-v0.45.0.patch
+#   ComfyUI v0.46.2 + patches/comfyui-v0.46.2.patch
 #   + Spark-H3 0.2.0 sparse attention (Blackwell / sm_120 build, from its GitHub release, checksum-verified)
 #   + ComfyUI-Spectrum-MiniMax-H3 (pinned commit)
 #   + the Comfy-Org/MiniMax-H3 weights (pinned Hugging Face revision).
@@ -23,7 +23,8 @@ SPARK=${SPARK:-auto}
 PYTHON=${PYTHON:-python3}
 
 COMFY_REPO=https://github.com/Comfy-Org/ComfyUI.git
-COMFY_COMMIT=989d93d0d968e704c589ce0146bb18c77f6b50cc          # v0.45.0
+COMFY_COMMIT=10cdd12609eb17e8a90f2a2dd811b1c82f6107e7          # v0.46.2
+COMFY_PATCH=comfyui-v0.46.2.patch
 SPARK_TAG=comfyui-v0.2.0
 SPARK_ZIP=ComfyUI-Spark-H3-0.2.0-linux-x86_64-sm120-cu130.zip
 SPARK_SHA256=b51a3ab20c6e677de67bfc3693727ff3789c9d2077680b4ff540d5766593858d
@@ -53,15 +54,17 @@ if [ -n "${DRIVER:-}" ] && [ "$DRIVER" -lt 580 ]; then
 fi
 echo "Spark-H3: $SPARK"
 
-say "ComfyUI v0.45.0 at $DEST"
+say "ComfyUI v0.46.2 at $DEST"
 if [ ! -d "$DEST/.git" ]; then
   git clone -q "$COMFY_REPO" "$DEST"
 fi
+# an existing clone from before this version does not have the commit yet
+git -C "$DEST" cat-file -e "$COMFY_COMMIT^{commit}" 2>/dev/null || git -C "$DEST" fetch -q origin
 git -C "$DEST" checkout -q "$COMFY_COMMIT"
-if git -C "$DEST" apply --reverse --check "$HERE/patches/comfyui-v0.45.0.patch" 2>/dev/null; then
+if git -C "$DEST" apply --reverse --check "$HERE/patches/$COMFY_PATCH" 2>/dev/null; then
   echo "patch already applied"
 else
-  git -C "$DEST" apply "$HERE/patches/comfyui-v0.45.0.patch"
+  git -C "$DEST" apply "$HERE/patches/$COMFY_PATCH"
   echo "patch applied"
 fi
 

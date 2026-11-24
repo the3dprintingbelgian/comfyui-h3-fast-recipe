@@ -7,7 +7,7 @@ What it puts together:
 
 | Piece | Version | Source |
 |---|---|---|
-| ComfyUI | v0.45.0 (`989d93d0`) + [`patches/comfyui-v0.45.0.patch`](patches/comfyui-v0.45.0.patch) | [Comfy-Org/ComfyUI](https://github.com/Comfy-Org/ComfyUI) |
+| ComfyUI | v0.46.2 (`10cdd126`) + [`patches/comfyui-v0.46.2.patch`](patches/comfyui-v0.46.2.patch) | [Comfy-Org/ComfyUI](https://github.com/Comfy-Org/ComfyUI) |
 | Spark-H3 sparse attention | 0.2.0, Linux sm_120 / CUDA 13 build, sha256-checked | [zechengtang/Spark-H3](https://github.com/zechengtang/Spark-H3) release `comfyui-v0.2.0` |
 | Spectrum for H3 | `7df883b` | [xmarre/ComfyUI-Spectrum-MiniMax-H3](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3) |
 | torch | 2.11.0 + CUDA 13.0 | PyTorch cu130 wheels |
@@ -63,7 +63,8 @@ shot with stock nodes and the int8 text encoder.
 
 ## What the patch changes
 
-`patches/comfyui-v0.45.0.patch` touches five files of ComfyUI v0.45.0:
+`patches/comfyui-v0.46.2.patch` touches five files of ComfyUI v0.46.2 (none of them changed upstream between v0.45.0
+and v0.46.2, so the change is the same as `patches/comfyui-v0.45.0.patch`, which stays here for a v0.45.0 tree):
 
 1. **MiniMax H3 Fun ControlNet as a conditioning ControlNet** (`comfy/controlnet.py`, `comfy/ldm/minimax/model.py`,
    `comfy_extras/nodes_minimax_h3.py`): loads the Fun ControlNet-Union (VideoX-Fun naming or core naming, int8 too)
@@ -76,9 +77,9 @@ shot with stock nodes and the int8 text encoder.
 3. **Wan Animate 2 `log_scale`** (`comfy/ldm/wan/model_animate2.py`, `comfy_extras/nodes_wan.py`): an additive
    attention bias for the first generated latent frame, as used by distilled Animate-2 recipes (-1.3).
 
-Differences from stock v0.45.0 to know about:
+Differences from stock v0.46.2 to know about:
 
-- `MiniMaxH3FunControlNetApply` becomes the conditioning version. A graph made for stock v0.45.0 that uses the
+- `MiniMaxH3FunControlNetApply` becomes the conditioning version. A graph made for stock ComfyUI that uses the
   model-patch version of that node must use `MiniMaxH3FunControlNetApplyV2` instead.
 - References with a long edge above 3584 px are scaled a little further in `max` mode than stock does.
 - Everything else only changes graphs that use the new inputs.
